@@ -27,6 +27,7 @@ class SubtitleEntry:
     timestamp: str
     filename: str
     image_similarity: float = 0.0  # 添加图像相似度字段
+    id: int = None  # 新增 id 字段
 
 class SubtitleSearch:
     def __init__(self, subtitle_folder, model_name='BAAI/bge-large-zh-v1.5'):
@@ -37,9 +38,8 @@ class SubtitleSearch:
         self.min_image_similarity = 0.6
         self.search_k = 5
         self.index = None
-        self.sentence_embeddings = None
-        self.min_text_similarity = 0.5  # 添加文本相似度阈值
-        
+        self.min_text_similarity = 0.5
+    
     def load_subtitles(self):
         json_files = [f for f in os.listdir(self.subtitle_folder) if f.endswith('.json')]
         for filename in tqdm(json_files, desc="加载字幕文件"):
@@ -56,26 +56,47 @@ class SubtitleSearch:
                             image_similarity=entry.get('similarity', 0.0)  # 读取图像相似度
                         ))
 
+    def load_subtitle_file(self, filename):
+        """加载单个字幕文件"""
+        filepath = os.path.join(self.subtitle_folder, filename)
+        entries = []
+        with open(filepath, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+            video_name = filename[:-5]  # 去除.json后缀
+            for entry in data:
+                entries.append(SubtitleEntry(
+                    text=entry['text'],
+                    timestamp=entry['timestamp'],
+                    filename=video_name,
+                    image_similarity=entry.get('similarity', 0.0)
+                ))
+        return entries
+
     def create_index(self):
         texts = [entry.text for entry in self.entries]
-        self.sentence_embeddings = self.model.encode(
+        embeddings = self.model.encode(
             texts,
             show_progress_bar=True,
             batch_size=SEARCH_BATCH_SIZE
         )
-        dimension = self.sentence_embeddings.shape[1]
+        dimension = embeddings.shape[1]
+        base_index = faiss.IndexFlatL2(dimension)
+        idmap = faiss.IndexIDMap(base_index)
+        # 为每个条目分配 id（使用 顺序编号 ）
+        for i, entry in enumerate(self.entries):
+            entry.id = int(i)
+        id_array = np.arange(len(self.entries), dtype=np.int64)
+        idmap.add_with_ids(embeddings, id_array)
         if USE_GPU_SEARCH:
             res = faiss.StandardGpuResources()
-            self.index = faiss.GpuIndexFlatL2(res, dimension)
+            self.index = faiss.index_cpu_to_gpu(res, 0, idmap)
         else:
-            self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(self.sentence_embeddings)
+            self.index = idmap
 
     def save_index(self, index_dir):
-        """保存索引和嵌入向量到文件"""
+        """保存索引和条目数据到文件"""
         os.makedirs(index_dir, exist_ok=True)
         index_path = os.path.join(index_dir, 'faiss.index')
-        embeddings_path = os.path.join(index_dir, 'embeddings.npy')
         entries_path = os.path.join(index_dir, 'entries.json')
         
         # 如果是GPU索引，需要先转换为CPU索引再保存
@@ -85,16 +106,14 @@ class SubtitleSearch:
         else:
             faiss.write_index(self.index, index_path)
         
-        # 保存嵌入向量
-        np.save(embeddings_path, self.sentence_embeddings)
-        
         # 保存entries数据
         entries_data = [
             {
                 'text': e.text,
                 'timestamp': e.timestamp,
                 'filename': e.filename,
-                'image_similarity': e.image_similarity
+                'image_similarity': e.image_similarity,
+                'id': e.id  # 保存 id 字段
             }
             for e in self.entries
         ]
@@ -102,9 +121,8 @@ class SubtitleSearch:
             json.dump(entries_data, f, ensure_ascii=False, indent=2)
 
     def load_index(self, index_dir):
-        """从文件加载索引和嵌入向量"""
+        """从文件加载索引和条目数据"""
         index_path = os.path.join(index_dir, 'faiss.index')
-        embeddings_path = os.path.join(index_dir, 'embeddings.npy')
         entries_path = os.path.join(index_dir, 'entries.json')
         
         # 先加载为CPU索引
@@ -116,9 +134,6 @@ class SubtitleSearch:
             self.index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
         else:
             self.index = cpu_index
-            
-        # 加载嵌入向量
-        self.sentence_embeddings = np.load(embeddings_path)
         
         # 加载entries数据
         with open(entries_path, 'r', encoding='utf-8') as f:
@@ -127,6 +142,85 @@ class SubtitleSearch:
                 SubtitleEntry(**entry)
                 for entry in entries_data
             ]
+
+    def update_index(self):
+        # 读取所有当前文件的条目
+        current_entries = {}
+        for filename in os.listdir(self.subtitle_folder):
+            if filename.endswith('.json'):
+                video_name = filename[:-5]  # 去掉.json后缀
+                with open(os.path.join(self.subtitle_folder, filename), 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for entry in data:
+                        key = (video_name, entry['timestamp'])
+                        current_entries[key] = entry['text']
+        # 构建原有条目映射（仅包含 id 不为空的）
+        existing_map = { (entry.filename, entry.timestamp): entry for entry in self.entries if entry.id is not None }
+        
+        new_entries = []
+        changed_entries = []          # 记录文本改变的条目（需要更新向量）
+        incremental_entries = []      # 记录全新的条目（需要添加向量）
+        
+        for key, text in current_entries.items():
+            if key in existing_map:
+                exist = existing_map[key]
+                if exist.text != text:
+                    # 文本改变，保留原有 id
+                    new_entry = SubtitleEntry(
+                        text=text,
+                        timestamp=key[1],
+                        filename=key[0],
+                        image_similarity=0.0,
+                        id=exist.id
+                    )
+                    new_entries.append(new_entry)
+                    changed_entries.append(new_entry)
+                else:
+                    new_entries.append(exist)
+            else:
+                # 全新条目
+                new_ent = SubtitleEntry(
+                    text=text,
+                    timestamp=key[1],
+                    filename=key[0],
+                    image_similarity=0.0
+                )
+                new_entries.append(new_ent)
+                incremental_entries.append(new_ent)
+        
+        # 对全新条目分配新的 id
+        existing_ids = [entry.id for entry in self.entries if entry.id is not None]
+        max_id = max(existing_ids) if existing_ids else -1
+        for entry in incremental_entries:
+            max_id += 1
+            entry.id = max_id
+        
+        # 针对文本变化的条目，逐条更新：
+        for entry in changed_entries:
+            # 删除旧向量
+            self.index.remove_ids(np.array([entry.id], dtype=np.int64))
+            # 计算更新后的向量并重新添加（这里单个调用也可以合并成批处理）
+            embedding = self.model.encode([entry.text], batch_size=SEARCH_BATCH_SIZE)
+            self.index.add_with_ids(embedding, np.array([entry.id], dtype=np.int64))
+        
+        # 对全新条目批量添加向量
+        if incremental_entries:
+            new_texts = [ent.text for ent in incremental_entries]
+            new_embeddings = self.model.encode(
+                new_texts,
+                batch_size=SEARCH_BATCH_SIZE
+            )
+            new_ids = np.array([ent.id for ent in incremental_entries], dtype=np.int64)
+            self.index.add_with_ids(new_embeddings, new_ids)
+        
+        self.entries = new_entries
+        
+        return {
+            'old_count': len(existing_map),
+            'new_count': len(self.entries),
+            'diff': len(self.entries) - len(existing_map),
+            'new_entries': len(incremental_entries)
+        }
 
     def search(self, query, k=None):
         if k is None:
@@ -178,10 +272,10 @@ if __name__ == "__main__":
         # 检查索引文件是否存在
         if os.path.exists(index_dir):
             console.print("\n[cyan]发现已存在的索引文件[/]")
-            console.print("\n1. 使用已有索引\n2. 重新构建索引")
+            console.print("\n1. 使用已有索引\n2. 更新索引\n3. 重新构建索引")
             choice = Prompt.ask(
                 "请选择",
-                choices=["1", "2"],
+                choices=["1", "2", "3"],
                 default="1"
             )
             
@@ -189,6 +283,21 @@ if __name__ == "__main__":
                 console.print("[cyan]正在加载索引...[/]")
                 searcher.load_index(index_dir)
                 console.print("[green]索引加载完成![/]")
+                input("\n按Enter继续...")
+            elif choice == "2":
+                console.print("[cyan]正在加载索引...[/]")
+                searcher.load_index(index_dir)
+                console.print("[cyan]正在更新索引...[/]")
+                stats = searcher.update_index()
+                console.print("[cyan]正在保存索引...[/]")
+                searcher.save_index(index_dir)
+                console.print(
+                    f"[green]索引更新完成![/]\n"
+                    f"原有条目: {stats['old_count']}\n"
+                    f"现有条目: {stats['new_count']}\n" 
+                    f"新增条目: {stats['new_entries']}\n"
+                    f"净变化: {stats['diff']:+d}"
+                )
                 input("\n按Enter继续...")
             else:
                 console.print("[cyan]准备构建新索引...[/]")
